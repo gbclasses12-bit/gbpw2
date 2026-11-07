@@ -12,16 +12,83 @@ const PORT = Number(process.env.PORT) || 3000;
 const TARGET_HOST = 'pwmarco.xyz';
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
 
-// Normalize URL for Vercel Serverless Function rewrites so original routes match Express
-app.use((req: Request, _res: Response, next) => {
-  const matchedPath = req.headers['x-matched-path'] as string;
-  if (matchedPath) {
-    req.url = matchedPath;
-  } else if (req.originalUrl && req.url !== req.originalUrl) {
-    req.url = req.originalUrl;
+// Resolve real requested path across local dev and Vercel Serverless Function rewrites
+function resolveRequestPath(req: Request): string {
+  // 1. Check x-forwarded-uri (set by Vercel / Cloudflare edge to original request URI)
+  const forwardedUri = req.headers['x-forwarded-uri'] as string;
+  if (
+    forwardedUri &&
+    forwardedUri !== '/api' &&
+    forwardedUri !== '/api/' &&
+    forwardedUri !== '/api/index' &&
+    forwardedUri !== '/api/index.ts' &&
+    !forwardedUri.startsWith('/api/index?') &&
+    !forwardedUri.startsWith('/api?')
+  ) {
+    return forwardedUri;
   }
+
+  // 2. Check __vercel_path query param from vercel.json rewrite
+  if (req.query && typeof req.query.__vercel_path === 'string') {
+    const raw = req.query.__vercel_path;
+    const clean = raw.startsWith('/') ? raw : `/${raw}`;
+    // Reconstruct other query parameters
+    const params = new URLSearchParams();
+    for (const [key, val] of Object.entries(req.query)) {
+      if (key !== '__vercel_path' && val !== undefined) {
+        if (Array.isArray(val)) {
+          val.forEach((v) => params.append(key, String(v)));
+        } else {
+          params.append(key, String(val));
+        }
+      }
+    }
+    const qs = params.toString();
+    return qs ? `${clean}?${qs}` : clean;
+  }
+
+  // 3. Check x-invoke-path (set by Vercel)
+  const invokePath = req.headers['x-invoke-path'] as string;
+  if (
+    invokePath &&
+    invokePath !== '/api' &&
+    invokePath !== '/api/' &&
+    invokePath !== '/api/index' &&
+    invokePath !== '/api/index.ts'
+  ) {
+    return invokePath;
+  }
+
+  // 4. Check req.originalUrl / req.url
+  const currentUrl = req.originalUrl || req.url || '/';
+  if (
+    currentUrl !== '/api' &&
+    currentUrl !== '/api/' &&
+    currentUrl !== '/api/index' &&
+    currentUrl !== '/api/index.ts' &&
+    !currentUrl.startsWith('/api/index?') &&
+    !currentUrl.startsWith('/api?')
+  ) {
+    return currentUrl;
+  }
+
+  return '/study/batches';
+}
+
+app.use((req: Request, res: Response, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  const resolved = resolveRequestPath(req);
+  req.url = resolved;
+  (req as any).resolvedPath = resolved;
   next();
 });
+
 
 // User-specified brand requirements:
 // 1. Name: GB STUDY
@@ -217,6 +284,33 @@ function transformContent(rawContent: string, isHtml: boolean, currentHost: stri
         }
       } catch(e) {}
     }
+
+    // 2. Global error & rejection suppression to prevent Next.js ErrorBoundary crash
+    try {
+      window.addEventListener('error', function(e) {
+        if (e && e.message) {
+          if (
+            e.message.includes('fetch') ||
+            e.message.includes('Hydration') ||
+            e.message.includes('Minified React error') ||
+            e.message.includes('reading null') ||
+            e.message.includes('reading undefined') ||
+            e.message.includes('ChunkLoadError')
+          ) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }
+      }, true);
+      window.addEventListener('unhandledrejection', function(e) {
+        if (e) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          return true;
+        }
+      }, true);
+    } catch(e) {}
   })();
   </script>
   <title>${APP_NAME}</title>
@@ -336,18 +430,32 @@ app.get('/api/player-options', (_req: Request, res: Response) => {
   return res.json({ dashEnabled: false, hlsEnabled: true });
 });
 
+// Mock telemetry logger to prevent 404s
+app.all('/api/log', (_req: Request, res: Response) => {
+  return res.json({ success: true });
+});
+
 // Reverse proxy handler for all routes
 app.all('*', async (req: Request, res: Response) => {
   try {
-    const originalUrl = req.originalUrl;
-    const targetUrl = `${TARGET_ORIGIN}${originalUrl}`;
+    const requestPath = (req as any).resolvedPath || req.url || '/study/batches';
+    const targetUrl = `${TARGET_ORIGIN}${requestPath}`;
 
-    // Read incoming request body if present
-    const bodyChunks: Buffer[] = [];
-    for await (const chunk of req) {
-      bodyChunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    // Read incoming request body if present (non-GET / non-HEAD only)
+    let reqBody: Buffer | undefined = undefined;
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      if ((req as any).body) {
+        reqBody = Buffer.isBuffer((req as any).body)
+          ? (req as any).body
+          : Buffer.from(typeof (req as any).body === 'string' ? (req as any).body : JSON.stringify((req as any).body));
+      } else {
+        const bodyChunks: Buffer[] = [];
+        for await (const chunk of req) {
+          bodyChunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        }
+        if (bodyChunks.length > 0) reqBody = Buffer.concat(bodyChunks);
+      }
     }
-    const reqBody = bodyChunks.length > 0 ? Buffer.concat(bodyChunks) : undefined;
 
     // Cookie management
     let incomingCookies = req.headers.cookie || '';
@@ -364,7 +472,7 @@ app.all('*', async (req: Request, res: Response) => {
     const forwardHeaders: Record<string, string> = {
       Host: TARGET_HOST,
       Origin: TARGET_ORIGIN,
-      Referer: `${TARGET_ORIGIN}${originalUrl}`,
+      Referer: `${TARGET_ORIGIN}${requestPath}`,
       'User-Agent':
         (req.headers['user-agent'] as string) ||
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -393,7 +501,7 @@ app.all('*', async (req: Request, res: Response) => {
     const upstreamRes = await fetch(targetUrl, {
       method: req.method,
       headers: forwardHeaders,
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? reqBody : undefined,
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? (reqBody as any) : undefined,
       redirect: 'manual',
     });
 
