@@ -12,6 +12,17 @@ const PORT = Number(process.env.PORT) || 3000;
 const TARGET_HOST = 'pwmarco.xyz';
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
 
+// Normalize URL for Vercel Serverless Function rewrites so original routes match Express
+app.use((req: Request, _res: Response, next) => {
+  const matchedPath = req.headers['x-matched-path'] as string;
+  if (matchedPath) {
+    req.url = matchedPath;
+  } else if (req.originalUrl && req.url !== req.originalUrl) {
+    req.url = req.originalUrl;
+  }
+  next();
+});
+
 // User-specified brand requirements:
 // 1. Name: GB STUDY
 // 2. Telegram URL: https://t.me/GBFreestudy
@@ -515,7 +526,12 @@ app.all('*', async (req: Request, res: Response) => {
   }
 });
 
-// Start Express server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`GB STUDY server running at http://0.0.0.0:${PORT}`);
-});
+// Export Express app for Vercel Serverless Functions
+export default app;
+
+// Start Express server in standalone / AI Studio preview environment
+if (!process.env.VERCEL && !process.env.NOW_REGION) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`GB STUDY server running at http://0.0.0.0:${PORT}`);
+  });
+}
